@@ -18,6 +18,8 @@ export function useSubscriptionForms({ addSubscription, updateSubscription }) {
             enabled: true,
             exclude: '',
             customUserAgent: 'MiSub',
+            fetchProxy: '',
+            plusAsSpace: false,
             notes: ''
         };
         showModal.value = true;

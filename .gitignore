@@ -1,6 +1,7 @@
 CLAUDE.md
 wrangler.toml
 template.yaml
+edgeone.json
 
 
 progame/
@@ -99,3 +100,5 @@ test-screenshots/
 # Docker (Closed Source)
 docker/
 data/
+/brain/
+/scratch/

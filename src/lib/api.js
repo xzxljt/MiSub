@@ -98,12 +98,20 @@ export async function saveMisubs(misubs, profiles) {
     }
 }
 
-export async function fetchNodeCount(subUrl) {
+export async function fetchNodeCount(subUrl, fetchProxy = '', plusAsSpace = false) {
     try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 60000); // 60秒超时
 
-        const data = await api.post('/api/node_count', { url: subUrl }, { signal: controller.signal });
+        const payload = { url: subUrl };
+        if (fetchProxy) {
+            payload.fetchProxy = fetchProxy;
+        }
+        if (plusAsSpace) {
+            payload.plusAsSpace = true;
+        }
+
+        const data = await api.post('/api/node_count', payload, { signal: controller.signal });
         clearTimeout(timeoutId);
 
         return { success: true, data }; // data 包含 { count, userInfo }
@@ -137,6 +145,19 @@ export async function saveSettings(settings) {
         return handleApiError(error, 'saveSettings');
     }
 }
+
+/**
+ * 恢复出厂设置（仅限设置项，不删除节点和订阅组）
+ * @returns {Promise<Object>} - 重置结果
+ */
+export async function resetSettings() {
+    try {
+        return await api.post('/api/settings/reset');
+    } catch (error) {
+        return handleApiError(error, 'resetSettings');
+    }
+}
+
 
 /**
  * 批量更新订阅的节点信息
@@ -174,6 +195,38 @@ export async function migrateToD1() {
             };
         }
         return handleApiError(error, 'migrateToD1');
+    }
+}
+
+export async function detectLegacyD1() {
+    try {
+        return await api.get('/api/detect_legacy_d1');
+    } catch (error) {
+        return handleApiError(error, 'detectLegacyD1');
+    }
+}
+
+export async function migrateLegacyD1() {
+    try {
+        return await api.post('/api/migrate_legacy_d1');
+    } catch (error) {
+        if (error instanceof APIError) {
+            return {
+                success: false,
+                error: error.message,
+                errorType: 'server',
+                details: error.data?.details || error.data?.errors
+            };
+        }
+        return handleApiError(error, 'migrateLegacyD1');
+    }
+}
+
+export async function fetchGithubLatestRelease(repo) {
+    try {
+        return await api.get(`/api/github/release?repo=${encodeURIComponent(repo)}`);
+    } catch (error) {
+        return handleApiError(error, 'fetchGithubLatestRelease');
     }
 }
 

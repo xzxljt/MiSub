@@ -20,9 +20,16 @@
 
 import { handleMisubRequest } from './modules/subscription-handler.js';
 import { handleApiRequest } from './modules/api-router.js';
-import { createJsonResponse } from './modules/utils.js';
+import { createJsonResponse, migrateConfigSettings } from './modules/utils.js';
 import { corsMiddleware, securityHeadersMiddleware } from './middleware/cors.js';
 import { handleDisguiseRequest } from './modules/handlers/disguise-handler.js';
+import { createDisguiseResponse } from './modules/disguise-page.js';
+
+// 静态导入核心依赖以优化冷加载
+import { StorageFactory, SettingsCache } from './storage-adapter.js';
+import { KV_KEY_SETTINGS, DEFAULT_SETTINGS as defaultSettings } from './modules/config.js';
+import { handleCronTrigger } from './modules/notifications.js';
+import { authMiddleware } from './modules/auth-middleware.js';
 
 function parseCorsOrigins(env, requestUrl) {
     const configured = (env?.CORS_ORIGINS || '')
@@ -45,7 +52,13 @@ function applyNoStoreToHtmlResponse(response) {
         return response;
     }
     const headers = new Headers(response.headers);
+    headers.delete('Content-Encoding');
+    headers.delete('content-encoding');
+    headers.delete('Content-Length');
+    headers.delete('content-length');
     headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    headers.set('CDN-Cache-Control', 'no-store, no-cache, must-revalidate');
+    headers.set('Surrogate-Control', 'no-store, no-cache, must-revalidate');
     headers.set('Pragma', 'no-cache');
     headers.set('Expires', '0');
     return new Response(response.body, {
@@ -53,6 +66,77 @@ function applyNoStoreToHtmlResponse(response) {
         statusText: response.statusText,
         headers
     });
+}
+
+const INTERNAL_SPA_FETCH_HEADER = 'x-misub-internal-spa-fetch';
+const INTERNAL_ORIGIN_ASSET_FETCH_HEADER = 'x-misub-origin-asset-fetch';
+
+function normalizeLoginPath(customLoginPath) {
+    if (typeof customLoginPath !== 'string') return '/login';
+    const normalized = customLoginPath.trim().replace(/^\/+/g, '');
+    return normalized ? `/${normalized}` : '/login';
+}
+
+async function fetchHostedAssetViaOrigin(request, assetPath) {
+    const assetUrl = new URL(assetPath, request.url);
+    const headers = new Headers(request.headers);
+    headers.delete(INTERNAL_SPA_FETCH_HEADER);
+    headers.set(INTERNAL_ORIGIN_ASSET_FETCH_HEADER, '1');
+
+    return fetch(new Request(assetUrl.toString(), {
+        method: ['GET', 'HEAD'].includes(request.method) ? request.method : 'GET',
+        headers
+    }), {
+        cf: { cacheTtl: 0, cacheEverything: false }
+    });
+}
+
+async function fetchStaticAsset(request, env, next) {
+    if (typeof next === 'function') {
+        return next();
+    }
+
+    if (typeof env?.ASSETS?.fetch === 'function') {
+        return env.ASSETS.fetch(request);
+    }
+
+    if (request.headers.get(INTERNAL_ORIGIN_ASSET_FETCH_HEADER) === '1') {
+        return new Response('Not Found', { status: 404 });
+    }
+
+    const url = new URL(request.url);
+
+    if (url.pathname === '/') {
+        return fetchHostedAssetViaOrigin(request, '/index.html');
+    }
+
+    if (url.pathname === '/index.html' || /\.\w+$/.test(url.pathname)) {
+        return fetchHostedAssetViaOrigin(request, `${url.pathname}${url.search}`);
+    }
+
+    return new Response('Not Found', { status: 404 });
+}
+
+async function fetchSpaEntry(request, env, next) {
+    const indexUrl = new URL('/', request.url);
+
+    if (typeof env?.ASSETS?.fetch === 'function') {
+        return env.ASSETS.fetch(new Request(indexUrl, request));
+    }
+
+    if (typeof next === 'function') {
+        const headers = new Headers(request.headers);
+        headers.set(INTERNAL_SPA_FETCH_HEADER, '1');
+
+        if (new URL(request.url).pathname === '/') {
+            return applyNoStoreToHtmlResponse(await next());
+        }
+
+        const assetsResponse = await fetchStaticAsset(new Request(indexUrl, request), env, next);
+        return applyNoStoreToHtmlResponse(assetsResponse);
+    }
+
+    return fetchHostedAssetViaOrigin(request, '/index.html');
 }
 
 /**
@@ -66,21 +150,32 @@ export async function onRequest(context) {
 
     try {
         const handleRequest = async () => {
+            const settings = await SettingsCache.get(env) || {};
+            const config = migrateConfigSettings({ ...defaultSettings, ...settings });
+
+            if (request.headers.get(INTERNAL_SPA_FETCH_HEADER) === '1') {
+                return applyNoStoreToHtmlResponse(await fetchStaticAsset(request, env, next));
+            }
+
+            // [新增] 动态识别订阅路由
+            // 只要路径以 /sub/, /s/, /sam/ 开头，或者是用户自定义的 mytoken/profileToken，就转交给 handleMisubRequest
+            const isExplicitSubRoute = url.pathname.startsWith('/sub/') || 
+                                     url.pathname.startsWith('/s/') || 
+                                     url.pathname.startsWith('/sam/');
+            
+            const firstSeg = url.pathname.split('/').filter(Boolean)[0];
+            const isCustomTokenRoute = firstSeg && (firstSeg === config.mytoken || firstSeg === config.profileToken);
+
             // 路由分发
             if (url.pathname.startsWith('/api/')) {
                 // API 路由
                 return await handleApiRequest(request, env);
-            } else if (url.pathname.startsWith('/sub/')) {
+            } else if (isExplicitSubRoute || isCustomTokenRoute) {
                 // MiSub 订阅路由
                 return await handleMisubRequest(context);
             } else if (url.pathname === '/cron') {
                 // 定时任务路由 (需要认证)
                 // 使用设置中的 cronSecret 进行验证
-                const { StorageFactory } = await import('./storage-adapter.js');
-                const { KV_KEY_SETTINGS } = await import('./modules/config.js');
-                const storageAdapter = StorageFactory.createAdapter(env, await StorageFactory.getStorageType(env));
-                const settings = await storageAdapter.get(KV_KEY_SETTINGS) || {};
-
                 const expectedSecret = settings.cronSecret;
 
                 if (!expectedSecret) {
@@ -100,24 +195,37 @@ export async function onRequest(context) {
                     return createJsonResponse({ error: 'Unauthorized' }, 401);
                 }
 
-                const { handleCronTrigger } = await import('./modules/notifications.js');
                 return await handleCronTrigger(env);
             } else {
+                const isLocalhost = ['localhost', '127.0.0.1'].includes(url.hostname);
+
+                // 本地 wrangler pages dev 调试兜底：优先返回静态资源，避免函数逻辑影响 SPA 首屏
+                if (isLocalhost) {
+                    let localResponse = await fetchStaticAsset(request, env, next);
+                    const isLikelySpaPath = !/\.\w+$/.test(url.pathname)
+                        && !url.pathname.startsWith('/api/')
+                        && !isExplicitSubRoute
+                        && !isCustomTokenRoute
+                        && url.pathname !== '/cron';
+
+                    if (localResponse.status === 404 && isLikelySpaPath) {
+                        const indexResponse = await fetchSpaEntry(request, env, next);
+                        if (indexResponse.status === 200) {
+                            localResponse = indexResponse;
+                        }
+                    }
+
+                    return applyNoStoreToHtmlResponse(localResponse);
+                }
                 // 静态文件处理
                 const isStaticAsset = /^\/(assets|@vite|src)\/./.test(url.pathname) || /\.\w+$/.test(url.pathname);
 
-                // [Smart Disguise & Custom Login Logic]
-                // 需要提前读取 Settings 来获取 customLoginPath
-                // 为了性能，只有在非静态资源且可能是 SPA 路由时才读取
-                let settings = {};
                 if (!isStaticAsset) {
-                    const { StorageFactory } = await import('./storage-adapter.js');
-                    const { KV_KEY_SETTINGS } = await import('./modules/config.js');
-                    const storageAdapter = StorageFactory.createAdapter(env, await StorageFactory.getStorageType(env));
-                    settings = await storageAdapter.get(KV_KEY_SETTINGS) || {};
+                    // 已提前读取过 settings
                 }
 
-                const customLoginPath = settings.customLoginPath ? '/' + settings.customLoginPath.replace(/^\//, '') : '/login';
+                const customLoginPath = normalizeLoginPath(settings?.customLoginPath);
+                const defaultLoginPath = '/login';
 
                 // SPA 路由白名单：这些请求应该交由前端路由处理，而不是作为订阅请求
                 // [修复] 增加更多可能的SPA路由，防止被误判为订阅请求
@@ -131,31 +239,29 @@ export async function onRequest(context) {
                     '/dashboard',
                     '/profile',
                     '/explore', // [新增] 公开页面
-                    '/offline',  // [修复] PWA 离线页面
                     customLoginPath // [新增] 自定义登录路径
                 ].some(route => url.pathname === route || url.pathname.startsWith(route + '/'));
 
-                const isLocalhost = ['localhost', '127.0.0.1'].includes(url.hostname);
                 const isProtectedSpaRoute = isSpaRoute
                     && url.pathname !== '/login'
                     && url.pathname !== customLoginPath
-                    && !url.pathname.startsWith('/explore')
-                    && url.pathname !== '/offline';
+                    && !url.pathname.startsWith('/explore');
 
                 // Route protection for SPA pages
                 // If accessing a protected route without auth, redirect to login
                 // [Fix] Exclude /explore from auth check
                 // [Fix] Skip auth check on localhost to avoid port 8787/5173 sync issues during dev
-                // [修复] 排除 /offline 路由的认证检查
+                if (customLoginPath !== defaultLoginPath && url.pathname === defaultLoginPath && !isLocalhost) {
+                    return new Response(null, {
+                        status: 302,
+                        headers: { Location: customLoginPath }
+                    });
+                }
+
                 if (isProtectedSpaRoute && !isLocalhost) {
-                    const { authMiddleware } = await import('./modules/auth-middleware.js');
                     const isAuthenticated = await authMiddleware(request, env);
                     if (!isAuthenticated) {
-                        // Redirect to login page
-                        return new Response(null, {
-                            status: 302,
-                            headers: { Location: '/login' }
-                        });
+                        return createDisguiseResponse(settings?.disguise, request.url);
                     }
                 }
 
@@ -189,7 +295,7 @@ export async function onRequest(context) {
                 }
 
                 // Continue to static assets or root
-                let response = await next();
+                let response = await fetchStaticAsset(request, env, next);
 
                 // [Fix] SPA Fallback: If asset not found (404) and it's an SPA route OR it's an HTML request, serve index.html
                 const acceptHeader = request.headers.get('Accept') || '';
@@ -199,16 +305,11 @@ export async function onRequest(context) {
                 const isHtmlRequest = isNavigationRequest && acceptHeader.includes('text/html');
 
                 if (response.status === 404 && (isSpaRoute || isHtmlRequest)) {
-                    // Clone the request to fetch index.html
-                    const indexUrl = new URL('/', request.url);
-                    const indexResponse = await env.ASSETS.fetch(new Request(indexUrl, request));
+                    const indexResponse = await fetchSpaEntry(request, env, next);
 
-                    // If index.html exists (e.g. in production or after build), return it
                     if (indexResponse.status === 200) {
                         response = indexResponse;
-                    } else {
-                        // If index.html is missing (likely local dev serving 'public' dir), redirect to Vite dev server
-                        // This assumes standard Vite port 5173.
+                    } else if (isLocalhost) {
                         return new Response(`Redirecting to frontend dev server...`, {
                             status: 302,
                             headers: {
@@ -217,7 +318,6 @@ export async function onRequest(context) {
                             }
                         });
                     }
-
                 }
 
                 return applyNoStoreToHtmlResponse(response);
@@ -228,7 +328,7 @@ export async function onRequest(context) {
             origins: parseCorsOrigins(env, url),
             allowCredentials: true
         };
-        return corsMiddleware(request, () => securityHeadersMiddleware(request, handleRequest), corsOptions);
+        return await corsMiddleware(request, () => securityHeadersMiddleware(request, handleRequest), corsOptions);
     } catch (error) {
         // 全局错误处理
         console.error('[Main Handler Error]', error);

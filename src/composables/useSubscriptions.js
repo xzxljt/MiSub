@@ -78,7 +78,7 @@ export function useSubscriptions(markDirty) {
     }, TIMING.REQUEST_TIMEOUT_MS);
 
     try {
-      const result = await fetchNodeCount(subToUpdate.url);
+      const result = await fetchNodeCount(subToUpdate.url, subToUpdate.fetchProxy, Boolean(subToUpdate.plusAsSpace));
 
       // 清除超时保护
       clearTimeout(timeoutId);
@@ -116,6 +116,8 @@ export function useSubscriptions(markDirty) {
         if (!isInitialLoad) {
           showToast(`${subToUpdate.name || '订阅'} 更新成功！`, 'success');
           markDirty();
+          // 自动保存手动更新的结果
+          void dataStore.saveData();
         }
       }
     } catch (error) {

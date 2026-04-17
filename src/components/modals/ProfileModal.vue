@@ -6,8 +6,10 @@ import SubscriptionSelector from './ProfileModal/SubscriptionSelector.vue';
 import NodeSelector from './ProfileModal/NodeSelector.vue';
 import { useManualNodes } from '../../composables/useManualNodes.js';
 import { useDataStore } from '../../stores/useDataStore.js';
+import { useSettingsStore } from '../../stores/settings.js';
 
 const dataStore = useDataStore();
+const settingsStore = useSettingsStore();
 const { manualNodeGroups } = useManualNodes(dataStore.markDirty);
 
 const props = defineProps({
@@ -31,45 +33,20 @@ const uiText = {
   manualPrefixToggle: '\u624b\u52a8\u8282\u70b9\u524d\u7f00',
   subscriptionPrefixToggle: '\u673a\u573a\u8ba2\u9605\u524d\u7f00',
   enable: '\u542f\u7528',
-  disable: '\u7981\u7528',
-  nodeTransformTitle: '\u8282\u70b9\u51c0\u5316\u7ba1\u9053'
+  disable: '\u7981\u7528'
 };
 const prefixToggleOptions = [
-  { label: '\u9ed8\u8ba4(\u5168\u5c40)', value: null },
-  { label: '\u542f\u7528', value: true },
-  { label: '\u7981\u7528', value: false }
+{ label: '默认(全局)', value: null },
+{ label: '启用', value: true },
+{ label: '禁用', value: false }
 ];
 
-const createDefaultNodeTransform = () => ({
-  enabled: false,
-  rename: {
-    regex: { enabled: false, rules: [] },
-    template: {
-      enabled: false,
-      template: '{emoji}{region}-{protocol}-{index}',
-      indexStart: 1,
-      indexPad: 2,
-      indexScope: 'regionProtocol',
-      regionAlias: {},
-      protocolAlias: { hysteria2: 'hy2' }
-    }
-  },
-  dedup: {
-    enabled: false,
-    mode: 'serverPort',
-    includeProtocol: false,
-    prefer: { protocolOrder: ['vless', 'trojan', 'vmess', 'hysteria2', 'ss', 'ssr'] }
-  },
-  sort: {
-    enabled: false,
-    nameIgnoreEmoji: true,
-    keys: [
-      { key: 'region', order: 'asc', customOrder: ['??', '??', '??', '???', '??', '??', '??', '??', '??', '???'] },
-      { key: 'protocol', order: 'asc', customOrder: ['vless', 'trojan', 'vmess', 'hysteria2', 'ss', 'ssr'] },
-      { key: 'name', order: 'asc' }
-    ]
-  }
-});
+const groupPrefixToggleOptions = [
+{ label: '默认(全局)', value: null },
+{ label: '启用', value: true },
+{ label: '禁用', value: false }
+];
+
 
 
 // 国家/地区代码到旗帜和中文名称的映射
@@ -132,7 +109,7 @@ const countryCodeMap = {
 
 const filteredSubscriptions = computed(() => {
   // Only consider items with valid http/https URLs as "Subscriptions"
-  const validSubs = props.allSubscriptions.filter(sub => 
+  const validSubs = props.allSubscriptions.filter(sub =>
     sub.url && /^https?:\/\//.test(sub.url)
   );
 
@@ -161,7 +138,7 @@ const filteredSubscriptions = computed(() => {
 const filteredManualNodes = computed(() => {
   let nodes = props.allManualNodes;
 
-      if (activeManualNodeGroupFilter.value) {
+  if (activeManualNodeGroupFilter.value) {
     if (activeManualNodeGroupFilter.value === '默认') {
       nodes = nodes.filter(n => !n.group);
     } else {
@@ -206,33 +183,61 @@ watch(() => props.profile, (newProfile) => {
     if (!profileCopy.prefixSettings || typeof profileCopy.prefixSettings !== 'object') {
       profileCopy.prefixSettings = {};
     }
-    profileCopy.prefixSettings.enableManualNodes =
-      profileCopy.prefixSettings.enableManualNodes ?? null;
-    profileCopy.prefixSettings.enableSubscriptions =
-      profileCopy.prefixSettings.enableSubscriptions ?? null;
-    profileCopy.prefixSettings.manualNodePrefix =
-      profileCopy.prefixSettings.manualNodePrefix ?? '';
+    profileCopy.prefixSettings.enableManualNodes = profileCopy.prefixSettings.enableManualNodes ?? null;
+    profileCopy.prefixSettings.enableSubscriptions = profileCopy.prefixSettings.enableSubscriptions ?? null;
+    profileCopy.prefixSettings.manualNodePrefix = profileCopy.prefixSettings.manualNodePrefix ?? '';
+    profileCopy.prefixSettings.prependGroupName = profileCopy.prefixSettings.prependGroupName ?? null;
+    
     if (Object.prototype.hasOwnProperty.call(profileCopy.prefixSettings, 'enableNodeEmoji')) {
       delete profileCopy.prefixSettings.enableNodeEmoji;
     }
-    profileCopy.nodeTransform = profileCopy.nodeTransform ?? null;
+    
+    // 确保 subconverter 对象存在
+    if (!profileCopy.subconverter || typeof profileCopy.subconverter !== 'object') {
+      profileSub: profileCopy.subconverter = {
+        engineMode: '',
+        backend: '',
+        options: {
+          udp: null,
+          emoji: null,
+          scv: null,
+          sort: null,
+          tfo: null,
+          list: null
+        }
+      };
+    } else {
+      // 补充缺失的 options 字段，支持 null (即跟随全局)
+      profileCopy.subconverter.options = profileCopy.subconverter.options || {};
+      const fields = ['udp', 'emoji', 'scv', 'sort', 'tfo', 'list'];
+      fields.forEach(f => {
+        if (profileCopy.subconverter.options[f] === undefined) {
+          profileCopy.subconverter.options[f] = null;
+        }
+      });
+    }
+
+    // 确保 operators 数组存在
+    profileCopy.operators = Array.isArray(profileCopy.operators) ? profileCopy.operators : [];
+    
     localProfile.value = profileCopy;
   } else {
-    localProfile.value = { 
-      name: '', 
-      enabled: true, 
-      subscriptions: [], 
-      manualNodes: [], 
-      customId: '', 
+    localProfile.value = {
+      name: '',
+      enabled: true,
+      subscriptions: [],
+      manualNodes: [],
+      customId: '',
       expiresAt: '',
-      isPublic: true, // [新增] 默认为 true
-      description: '', // [新增]
+      isPublic: true,
+      description: '',
       prefixSettings: {
         enableManualNodes: null,
         enableSubscriptions: null,
-        manualNodePrefix: ''
+        manualNodePrefix: '',
+        prependGroupName: null
       },
-      nodeTransform: null
+      operators: []
     };
   }
 }, { deep: true, immediate: true });
@@ -248,7 +253,7 @@ const handleConfirm = () => {
     } catch (e) {
       console.error("Error processing expiresAt date:", e);
       // Decide how to handle error: save as is, or clear it
-      profileToSave.expiresAt = ''; 
+      profileToSave.expiresAt = '';
     }
   }
   // 顺序已由用户通过拖拽确定，无需额外排序
@@ -256,87 +261,83 @@ const handleConfirm = () => {
 };
 
 const toggleSelection = (listName, id) => {
-    const list = localProfile.value[listName];
-    const index = list.indexOf(id);
-    if (index > -1) {
-        list.splice(index, 1);
-    } else {
-        list.push(id);
-    }
+  const list = localProfile.value[listName];
+  const index = list.indexOf(id);
+  if (index > -1) {
+    list.splice(index, 1);
+  } else {
+    list.push(id);
+  }
 };
 
 const handleSelectAll = (listName, sourceArray) => {
-    const currentSelection = new Set(localProfile.value[listName]);
-    sourceArray.forEach(item => currentSelection.add(item.id));
-    localProfile.value[listName] = Array.from(currentSelection);
+  const currentSelection = new Set(localProfile.value[listName]);
+  sourceArray.forEach(item => currentSelection.add(item.id));
+  localProfile.value[listName] = Array.from(currentSelection);
 };
 
 const handleDeselectAll = (listName, sourceArray) => {
-    const sourceIds = sourceArray.map(item => item.id);
-    localProfile.value[listName] = localProfile.value[listName].filter(id => !sourceIds.includes(id));
+  const sourceIds = sourceArray.map(item => item.id);
+  localProfile.value[listName] = localProfile.value[listName].filter(id => !sourceIds.includes(id));
 };
 
 // 处理拖拽排序后的 ID 顺序更新
 const updateSelectedIds = (listName, newIds) => {
-    localProfile.value[listName] = newIds;
+  localProfile.value[listName] = newIds;
 };
 
 </script>
 
 <template>
-  <Modal :show="show" @update:show="emit('update:show', $event)" @confirm="handleConfirm" size="2xl">
+  <Modal :show="show" @update:show="emit('update:show', $event)" @confirm="handleConfirm" size="6xl">
     <template #title>
       <div class="flex items-center gap-3">
-        <div class="p-2 rounded-xl bg-indigo-500/10">
+        <div class="p-2 misub-radius-lg bg-indigo-500/10">
           <!-- Folder Icon for Profile -->
-          <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-indigo-500" fill="none" viewBox="0 0 24 24"
+            stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round"
+              d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
           </svg>
         </div>
-        <h3 class="text-lg font-bold text-gray-800 dark:text-white">
-          {{ isNew ? '新增订阅组' : '编辑订阅组' }}
-        </h3>
+        <div>
+          <h3 class="text-lg font-bold text-gray-800 dark:text-white">
+            {{ isNew ? '新增订阅组' : '编辑订阅组' }}
+          </h3>
+          <p class="mt-0.5 text-sm text-gray-500 dark:text-gray-400">统一管理订阅组基础信息、节点来源和处理规则。</p>
+        </div>
       </div>
     </template>
     <template #body>
       <div v-if="localProfile" class="space-y-6">
-        <ProfileForm
-          :local-profile="localProfile"
-          :show-advanced="showAdvanced"
+        <ProfileForm 
+          :local-profile="localProfile" 
+          :show-advanced="showAdvanced" 
           :ui-text="uiText"
-          :prefix-toggle-options="prefixToggleOptions"
-          :create-default-node-transform="createDefaultNodeTransform"
-          @toggle-advanced="showAdvanced = !showAdvanced"
+          :prefix-toggle-options="prefixToggleOptions" 
+          :group-prefix-toggle-options="groupPrefixToggleOptions"
+          :global-settings="dataStore.settings"
+          @toggle-advanced="showAdvanced = !showAdvanced" 
         />
 
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
 
-          <SubscriptionSelector
-            :subscriptions="allSubscriptions"
-            :filtered-subscriptions="filteredSubscriptions"
-            :search-term="subscriptionSearchTerm"
-            :selected-ids="localProfile.subscriptions || []"
+          <SubscriptionSelector :subscriptions="allSubscriptions" :filtered-subscriptions="filteredSubscriptions"
+            :search-term="subscriptionSearchTerm" :selected-ids="localProfile.subscriptions || []"
             @update:search-term="subscriptionSearchTerm = $event"
             @update:selected-ids="updateSelectedIds('subscriptions', $event)"
             @toggle-selection="toggleSelection('subscriptions', $event)"
             @select-all="handleSelectAll('subscriptions', filteredSubscriptions)"
-            @deselect-all="handleDeselectAll('subscriptions', filteredSubscriptions)"
-          />
+            @deselect-all="handleDeselectAll('subscriptions', filteredSubscriptions)" />
 
-          <NodeSelector
-            :nodes="allManualNodes"
-            :filtered-nodes="filteredManualNodes"
-            :search-term="nodeSearchTerm"
-            :active-group-filter="activeManualNodeGroupFilter"
-            :groups="manualNodeGroups"
-            :selected-ids="localProfile.manualNodes || []"
-            @update:search-term="nodeSearchTerm = $event"
+          <NodeSelector :nodes="allManualNodes" :filtered-nodes="filteredManualNodes" :search-term="nodeSearchTerm"
+            :active-group-filter="activeManualNodeGroupFilter" :groups="manualNodeGroups"
+            :selected-ids="localProfile.manualNodes || []" @update:search-term="nodeSearchTerm = $event"
             @update:group-filter="activeManualNodeGroupFilter = $event"
             @update:selected-ids="updateSelectedIds('manualNodes', $event)"
             @toggle-selection="toggleSelection('manualNodes', $event)"
             @select-all="handleSelectAll('manualNodes', filteredManualNodes)"
-            @deselect-all="handleDeselectAll('manualNodes', filteredManualNodes)"
-          />
+            @deselect-all="handleDeselectAll('manualNodes', filteredManualNodes)" />
         </div>
 
       </div>

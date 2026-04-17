@@ -153,7 +153,7 @@ const protocolColorMap = {
   >
     <template #title>
       <div class="flex items-center gap-3">
-        <div class="p-2 rounded-xl bg-indigo-500/10">
+        <div class="p-2 misub-radius-lg bg-indigo-500/10">
           <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
             <path stroke-linecap="round" stroke-linejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
           </svg>
@@ -162,6 +162,7 @@ const protocolColorMap = {
           <h3 class="text-lg font-bold text-gray-800 dark:text-white">
             {{ isNew ? '新增手动节点' : '编辑手动节点' }}
           </h3>
+          <p v-if="!(isNew && isMultiLine)" class="mt-0.5 text-sm text-gray-500 dark:text-gray-400">支持单条编辑，也支持多行粘贴后批量导入节点。</p>
           <p v-if="isNew && isMultiLine" class="text-sm text-indigo-500 mt-0.5 font-medium flex items-center gap-1">
             <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
               <path fill-rule="evenodd" d="M3 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd" />
@@ -173,9 +174,9 @@ const protocolColorMap = {
     </template>
     
     <template #body>
-      <div class="space-y-5">
+      <div class="space-y-6">
         <!-- 名称和颜色标签 - 两栏布局 -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <!-- 节点名称 -->
           <div class="relative">
              <div class="flex flex-col">
@@ -230,7 +231,7 @@ const protocolColorMap = {
         <!-- 节点链接 -->
         <div class="relative group">
           <div 
-            class="relative border rounded-xl transition-all duration-300 overflow-hidden bg-gray-50 dark:bg-black/20 border-gray-200 dark:border-white/10"
+            class="relative border misub-radius-lg transition-all duration-300 overflow-hidden bg-gray-50 dark:bg-black/20 border-gray-200 dark:border-white/10"
             :class="[
               urlFocused 
                 ? 'ring-2 ring-primary-500/50 border-primary-500 dark:border-primary-500' 
@@ -269,7 +270,7 @@ const protocolColorMap = {
             </div>
             
              <!-- Focus Glow -->
-            <div class="absolute inset-0 rounded-xl pointer-events-none transition-opacity duration-300 opacity-0 group-focus-within:opacity-100 ring-1 ring-primary-500/20"></div>
+            <div class="absolute inset-0 misub-radius-lg pointer-events-none transition-opacity duration-300 opacity-0 group-focus-within:opacity-100 ring-1 ring-primary-500/20"></div>
           </div>
         </div>
 
@@ -287,7 +288,7 @@ const protocolColorMap = {
               共 {{ parsedNodes.length }} 个节点
             </span>
           </div>
-          <div class="max-h-48 overflow-y-auto rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
+          <div class="max-h-48 overflow-y-auto misub-radius-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
             <div 
               v-for="(node, idx) in parsedNodes.slice(0, 10)" 
               :key="idx"

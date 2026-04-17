@@ -6,6 +6,10 @@ import { useUIStore } from '../../stores/ui.js';
 const props = defineProps({
   config: Object,
   profiles: Array,
+  compact: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 const emit = defineEmits(['qrcode']);
@@ -45,7 +49,7 @@ const subLink = computed(() => {
     return baseUrl;
   }
   
-  const targetMapping = { 'Sing-Box': 'singbox', 'QuanX': 'quanx' };
+  const targetMapping = { 'Sing-Box': 'base64', 'QuanX': 'quanx' };
   const formatKey = (targetMapping[selectedFormat.value] || selectedFormat.value.toLowerCase());
   return `${baseUrl}?${formatKey}`;
 });
@@ -69,12 +73,12 @@ onUnmounted(() => {
 
 <template>
   <div>
-    <div class="bg-white/90 dark:bg-gray-900/80 backdrop-blur-md p-6 rounded-3xl border border-gray-100/80 dark:border-white/10 shadow-sm transition-all duration-300">
-      <h3 class="text-lg font-bold text-gray-900 dark:text-white mb-4 list-item-animation" style="--delay-index: 0">生成订阅链接</h3>
+    <div class="bg-white/90 dark:bg-gray-900/80 backdrop-blur-md misub-radius-lg border border-gray-100/80 dark:border-white/10 shadow-sm transition-all duration-300" :class="compact ? 'p-4' : 'p-6'">
+      <h3 class="font-bold text-gray-900 dark:text-white mb-4 list-item-animation" :class="compact ? 'text-base' : 'text-lg'" style="--delay-index: 0">生成订阅链接</h3>
 
       <div class="mb-4 list-item-animation" style="--delay-index: 1">
         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">1. 选择订阅内容</label>
-        <select v-model="selectedId" class="w-full px-3 py-2.5 bg-white/80 dark:bg-gray-800/70 border border-gray-200/80 dark:border-white/10 rounded-xl shadow-sm focus:outline-hidden focus:ring-2 focus:ring-primary-500/40 focus:border-primary-500 text-sm text-gray-900 dark:text-white input-enhanced">
+        <select v-model="selectedId" class="w-full px-3 py-2.5 bg-white/80 dark:bg-gray-800/70 border border-gray-200/80 dark:border-white/10 misub-radius-lg shadow-sm focus:outline-hidden focus:ring-2 focus:ring-primary-500/40 focus:border-primary-500 text-sm text-gray-900 dark:text-white input-enhanced">
             <option value="default">默认订阅 (全部启用节点)</option>
             <option v-for="profile in profiles" :key="profile.id" :value="profile.customId || profile.id">
                 {{ profile.name }}
@@ -84,13 +88,13 @@ onUnmounted(() => {
 
       <div class="mb-5 list-item-animation" style="--delay-index: 2">
         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">2. 选择格式</label>
-        <div class="grid grid-cols-3 gap-2">
+        <div class="grid gap-2" :class="compact ? 'grid-cols-2' : 'grid-cols-3'">
             <button
               v-for="(format, index) in formats"
               :key="format"
               @click="selectedFormat = format"
               :aria-pressed="selectedFormat === format"
-              class="px-3 py-2 text-xs font-medium rounded-xl border transition-colors flex justify-center items-center list-item-animation"
+              class="px-3 py-2 text-xs font-medium misub-radius-lg border transition-colors flex justify-center items-center list-item-animation min-h-[38px]"
               :style="{ '--delay-index': index }"
               :class="[
                 selectedFormat === format
@@ -109,7 +113,7 @@ onUnmounted(() => {
           :value="subLink"
           readonly
           :disabled="!isLinkValid"
-          class="w-full text-sm text-gray-600 dark:text-gray-300 bg-gray-100/80 dark:bg-gray-800/60 rounded-xl pl-3 pr-20 py-2.5 border border-gray-200/70 dark:border-white/10 focus:outline-hidden focus:ring-2 font-mono input-enhanced"
+          class="w-full text-sm text-gray-600 dark:text-gray-300 bg-gray-100/80 dark:bg-gray-800/60 misub-radius-lg pl-3 pr-20 py-2.5 border border-gray-200/70 dark:border-white/10 focus:outline-hidden focus:ring-2 font-mono input-enhanced"
           :class="{
             'focus:ring-primary-500': isLinkValid,
             'focus:ring-red-500 cursor-not-allowed': !isLinkValid,
@@ -117,13 +121,13 @@ onUnmounted(() => {
           }"
         />
         <div class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-1">
-          <button @click="$emit('qrcode', subLink, '订阅链接')" :disabled="!isLinkValid" class="flex h-9 w-9 items-center justify-center rounded-lg text-gray-400 transition-colors duration-200" :class="isLinkValid ? 'hover:text-primary-600 hover:bg-white/80 dark:hover:bg-gray-800' : 'cursor-not-allowed'" title="显示二维码">
+          <button @click="$emit('qrcode', subLink, '订阅链接')" :disabled="!isLinkValid" class="flex h-9 w-9 items-center justify-center misub-radius-md text-gray-400 transition-colors duration-200" :class="isLinkValid ? 'hover:text-primary-600 hover:bg-white/80 dark:hover:bg-gray-800' : 'cursor-not-allowed'" title="显示二维码">
              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
                <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 4.875c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5A1.125 1.125 0 0 1 3.75 9.375v-4.5ZM3.75 14.625c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5a1.125 1.125 0 0 1-1.125-1.125v-4.5ZM13.5 4.875c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5A1.125 1.125 0 0 1 13.5 9.375v-4.5Z" />
                <path stroke-linecap="round" stroke-linejoin="round" d="M6.75 6.75h.75v.75h-.75v-.75ZM6.75 16.5h.75v.75h-.75v-.75ZM16.5 6.75h.75v.75h-.75v-.75ZM13.5 13.5h.75v.75h-.75v-.75ZM13.5 19.5h.75v.75h-.75v-.75ZM19.5 13.5h.75v.75h-.75v-.75ZM19.5 19.5h.75v.75h-.75v-.75ZM16.5 16.5h.75v.75h-.75v-.75Z" />
              </svg>
           </button>
-          <button @click="copyToClipboard" :disabled="!isLinkValid" class="flex h-9 w-9 items-center justify-center rounded-lg text-gray-400 transition-colors duration-200" :class="isLinkValid ? 'hover:text-primary-600 hover:bg-white/80 dark:hover:bg-gray-800' : 'cursor-not-allowed'" title="复制链接">
+          <button @click="copyToClipboard" :disabled="!isLinkValid" class="flex h-9 w-9 items-center justify-center misub-radius-md text-gray-400 transition-colors duration-200" :class="isLinkValid ? 'hover:text-primary-600 hover:bg-white/80 dark:hover:bg-gray-800' : 'cursor-not-allowed'" title="复制链接">
              <Transition name="fade" mode="out-in">
                  <svg v-if="copied" xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3">
                      <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />

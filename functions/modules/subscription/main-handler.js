@@ -1,17 +1,102 @@
 import { StorageFactory } from '../../storage-adapter.js';
-import { migrateConfigSettings, formatBytes, getCallbackToken, getPublicBaseUrl, migrateProfileIds } from '../utils.js';
+import { migrateConfigSettings, formatBytes, migrateProfileIds, base64EncodeUtf8 } from '../utils.js';
 import { generateCombinedNodeList } from '../../services/subscription-service.js';
-import { sendEnhancedTgNotification } from '../notifications.js';
+import { sendEnhancedTgNotification, tgEscape } from '../notifications.js';
 import { KV_KEY_SUBS, KV_KEY_PROFILES, KV_KEY_SETTINGS, DEFAULT_SETTINGS as defaultSettings } from '../config.js';
 import { createDisguiseResponse } from '../disguise-page.js';
 import { generateCacheKey, setCache } from '../../services/node-cache-service.js';
 import { resolveRequestContext } from './request-context.js';
-import { buildSubconverterUrlVariants, getSubconverterCandidates, fetchFromSubconverter } from './subconverter-client.js';
 import { resolveNodeListWithCache } from './cache-manager.js';
-import { logAccessError, logAccessSuccess, shouldSkipLogging as shouldSkipAccessLog } from './access-logger.js';
-import { isBrowserAgent } from './user-agent-utils.js'; // [Added] Import centralized util
+import { ProcessorService } from '../../services/processor-service.js';
+import { logAccessSuccess, shouldSkipLogging as shouldSkipAccessLog } from './access-logger.js';
+import { isBrowserAgent, determineTargetFormat, isMetaCore } from './user-agent-utils.js'; // [Added] Import centralized util
 import { authMiddleware } from '../auth-middleware.js';
-import { generateBuiltinClashConfig } from './builtin-clash-generator.js'; // [Added] 内置 Clash 生成器
+import { transformBuiltinSubscription } from './transformer-factory.js';
+import { fetchTransformTemplate } from './transform-template-cache.js';
+import { buildTransformTemplateContext, renderTransformTemplate } from './transform-template-renderer.js';
+import { groupNodeLinesByRegion } from './region-groups.js';
+import { groupNodeLinesByProtocol } from './protocol-groups.js';
+import { shouldApplyExternalTemplateForTarget } from './template-compatibility.js';
+import { renderClashFromIniTemplate, renderLoonFromIniTemplate, renderQuanxFromIniTemplate, renderSingboxFromIniTemplate, renderSurgeFromIniTemplate } from './template-pipeline.js';
+import { getBuiltinTemplate } from './builtin-template-registry.js';
+
+const PROFILE_DOWNLOAD_COUNT_PREFIX = 'misub_profile_download_count_';
+
+function getProfileDownloadCountKey(profile) {
+    return `${PROFILE_DOWNLOAD_COUNT_PREFIX}${profile.customId || profile.id}`;
+}
+
+function buildTemplateProxyBlock(nodeList) {
+    return nodeList
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line && !line.startsWith('#'))
+        .join('\n');
+}
+
+function extractProxySectionFromBuiltin(content, targetFormat) {
+    if (typeof content !== 'string' || content.trim() === '') return '';
+
+    if (targetFormat === 'clash') {
+        const match = content.match(/proxies:\s*\n([\s\S]*?)\n\nproxy-groups:/i);
+        return match ? match[1].trim() : '';
+    }
+
+    if (targetFormat.startsWith('surge') || targetFormat === 'loon' || targetFormat === 'quanx') {
+        const match = content.match(/\[Proxy\]\s*\n([\s\S]*?)(?:\n\n\[|$)/i);
+        if (!match) return '';
+        return match[1]
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line && !/^DIRECT\s*=\s*direct$/i.test(line))
+            .join('\n');
+    }
+
+    if (targetFormat === 'singbox' || targetFormat === 'sing-box') {
+        try {
+            const config = JSON.parse(content);
+            if (config.outbounds && Array.isArray(config.outbounds)) {
+                // 过滤掉 direct, block, dns-out 等元 outbound
+                const proxies = config.outbounds.filter(o => 
+                    o.type !== 'direct' && o.type !== 'block' && o.type !== 'dns'
+                );
+                return JSON.stringify(proxies, null, 2);
+            }
+        } catch {
+            return '';
+        }
+    }
+
+    return '';
+}
+
+export function buildManagedConfigUrl(requestUrl) {
+    const managedUrl = new URL(requestUrl);
+    managedUrl.searchParams.delete('refresh');
+    managedUrl.searchParams.delete('nocache');
+    return managedUrl.toString();
+}
+
+export function resolveTemplateUrl(mode, value, fallbackUrl = '') {
+    const normalizedMode = typeof mode === 'string' ? mode.trim().toLowerCase() : '';
+    const normalizedValue = typeof value === 'string' ? value.trim() : '';
+    const normalizedFallback = typeof fallbackUrl === 'string' ? fallbackUrl.trim() : '';
+
+    if (normalizedMode === 'builtin') return '';
+    if (normalizedMode === 'global') return normalizedFallback;
+    if (normalizedMode === 'preset' || normalizedMode === 'custom') return normalizedValue;
+
+    return normalizedValue;
+}
+
+export function resolveTemplateSource(value) {
+    const normalizedValue = typeof value === 'string' ? value.trim() : '';
+    if (!normalizedValue) return { kind: 'none', value: '' };
+    if (normalizedValue.startsWith('builtin:')) {
+        return { kind: 'builtin', value: normalizedValue.slice('builtin:'.length) };
+    }
+    return { kind: 'remote', value: normalizedValue };
+}
 
 /**
  * 处理MiSub订阅请求
@@ -23,21 +108,16 @@ export async function handleMisubRequest(context) {
     const url = new URL(request.url);
     const userAgentHeader = request.headers.get('User-Agent') || "Unknown";
 
-    // [Debug Logging Entry]
-    if (!env.workers) {
-        console.log(`\n[MiSub Request] ${request.method} ${url.pathname}${url.search}`);
-        console.log(`[MiSub UA] ${userAgentHeader}`);
-    }
+    console.log(`\n[MiSub Request] ${request.method} ${url.pathname}${url.search}`);
+    console.log(`[MiSub UA] ${userAgentHeader}`);
 
     const storageAdapter = StorageFactory.createAdapter(env, await StorageFactory.getStorageType(env));
-    const [settingsData, misubsData, profilesData] = await Promise.all([
+    const [settingsData, allMisubs, allProfiles] = await Promise.all([
         storageAdapter.get(KV_KEY_SETTINGS),
-        storageAdapter.get(KV_KEY_SUBS),
-        storageAdapter.get(KV_KEY_PROFILES)
+        storageAdapter.getAllSubscriptions(),
+        storageAdapter.getAllProfiles()
     ]);
     const settings = settingsData || {};
-    const allMisubs = misubsData || [];
-    const allProfiles = profilesData || [];
 
     // 自动迁移旧版 profile ID（去除 'profile_' 前缀）
     if (migrateProfileIds(allProfiles)) {
@@ -47,15 +127,21 @@ export async function handleMisubRequest(context) {
     }
     // 关键：我们在这里定义了 `config`，后续都应该使用它
     const config = migrateConfigSettings({ ...defaultSettings, ...settings });
+    context.accessLogPersistenceMode = config.accessLogPersistenceMode || 'light';
 
-
+    // [Subconverter API] 提取 URL 控制参数，用于覆盖默认设置
+    const urlInclude = url.searchParams.get('include');
+    const urlExclude = url.searchParams.get('exclude');
+    const urlRename = url.searchParams.get('rename');
+    const urlEmoji = url.searchParams.get('emoji'); // true/false
+    const urlUdp = url.searchParams.get('udp');     // true/false
+    const urlTfo = url.searchParams.get('tfo');     // true/false
+    const urlScv = url.searchParams.get('scv');     // true/false (skip-cert-verify)
+    const urlList = url.searchParams.get('list') === 'true';
 
     const isBrowser = isBrowserAgent(userAgentHeader);
 
-    // [Debug Logging Logic]
-    if (!env.workers) {
-        console.log(`[MiSub Logic] isBrowser: ${isBrowser}, Disguise: ${config.disguise?.enabled}`);
-    }
+    console.log(`[MiSub Logic] isBrowser: ${isBrowser}, Disguise: ${config.disguise?.enabled}`);
 
     const isAuthenticated = await authMiddleware(request, env);
 
@@ -66,29 +152,27 @@ export async function handleMisubRequest(context) {
         return createDisguiseResponse(config.disguise, request.url);
     }
 
+    context.url = url; // [核心修复] 将 url 挂载到 context，确保后续服务能获取到 debug 参数
     const { token, profileIdentifier } = resolveRequestContext(url, config, allProfiles);
 
-    // [Debug Logging Parse]
-    if (!env.workers) {
-        console.log(`[MiSub Parse] Token: ${token}, Profile: ${profileIdentifier}`);
-    }
+    console.log(`[MiSub Parse] Token: ${token}, Profile: ${profileIdentifier}`);
     const shouldSkipLogging = shouldSkipAccessLog(userAgentHeader);
 
     let targetMisubs;
     let subName = config.FileName;
-    let effectiveSubConverter;
-    let effectiveSubConfig;
     let isProfileExpired = false; // Moved declaration here
-    let shouldUseEmoji = false;   // 是否在 subconverter 请求中启用 emoji
 
     const DEFAULT_EXPIRED_NODE = `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:443#${encodeURIComponent('您的订阅已失效')}`;
+
+    let currentProfile = null;
 
     if (profileIdentifier) {
         // [修正] 使用 config 變量
         if (!token || token !== config.profileToken) {
             return new Response('Invalid Profile Token', { status: 403 });
         }
-        const profile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
+        currentProfile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
+        const profile = currentProfile;
         if (profile && profile.enabled) {
             // Check if the profile has an expiration date and if it's expired
             if (profile.expiresAt) {
@@ -105,15 +189,27 @@ export async function handleMisubRequest(context) {
             } else {
                 subName = profile.name;
                 targetMisubs = [];
-                // Create a map for quick lookup
-                const misubMap = new Map(allMisubs.map(item => [item.id, item]));
+                const relatedIds = [
+                    ...(Array.isArray(profile.subscriptions) ? profile.subscriptions.map(item => typeof item === 'object' ? item.id : item) : []),
+                    ...(Array.isArray(profile.manualNodes) ? profile.manualNodes : [])
+                ].filter(Boolean);
+                const relatedSubs = typeof storageAdapter.getSubscriptionsByIds === 'function'
+                    ? await storageAdapter.getSubscriptionsByIds(Array.from(new Set(relatedIds)))
+                    : allMisubs;
+                const misubMap = new Map(relatedSubs.map(item => [item.id, item]));
 
                 // 1. Add subscriptions in order defined by profile
                 const profileSubIds = profile.subscriptions || [];
                 if (Array.isArray(profileSubIds)) {
-                    profileSubIds.forEach(id => {
-                        const sub = misubMap.get(id);
-                        if (sub && sub.enabled && typeof sub.url === 'string' && sub.url.startsWith('http')) {
+                    profileSubIds.forEach(item => {
+                        // 支持两种格式：纯字符串 ID 或 带有覆盖配置的对象 { id, exclude, operators, ... }
+                        const isObject = item && typeof item === 'object';
+                        const id = isObject ? item.id : item;
+                        
+                        const baseSub = misubMap.get(id);
+                        if (baseSub && baseSub.enabled && typeof baseSub.url === 'string' && baseSub.url.startsWith('http')) {
+                            // 如果是对象，则合并覆盖配置（Profile 级别的设置优先级更高）
+                            const sub = isObject ? { ...baseSub, ...item } : baseSub;
                             targetMisubs.push(sub);
                         }
                     });
@@ -130,47 +226,15 @@ export async function handleMisubRequest(context) {
                     });
                 }
             }
-            effectiveSubConverter = profile.subConverter && profile.subConverter.trim() !== '' ? profile.subConverter : config.subConverter;
-            effectiveSubConfig = profile.subConfig && profile.subConfig.trim() !== '' ? profile.subConfig : config.subConfig;
-
-            // 判断是否需要在 subconverter 中启用 emoji：使用回退逻辑（订阅组 > 全局 > 默认）
-            const defaultTemplate = '{emoji}{region}-{protocol}-{index}';
-            const globalNodeTransform = config.defaultNodeTransform || {};
-            const profileNodeTransform = profile.nodeTransform ?? null;
-            const hasProfileNodeTransform =
-                profileNodeTransform && Object.keys(profileNodeTransform).length > 0;
-
-            // 确定有效的 nodeTransform 配置（全局 vs 订阅组完整覆盖）
-            const effectiveTransform = hasProfileNodeTransform
-                ? profileNodeTransform
-                : globalNodeTransform;
-
-            const userTemplate = effectiveTransform?.rename?.template?.template || defaultTemplate;
-            const templateEnabled = effectiveTransform?.enabled && effectiveTransform?.rename?.template?.enabled;
-            shouldUseEmoji = templateEnabled && userTemplate.includes('{emoji}');
-
             // [新增] 增加订阅组下载计数
             // 仅在非回调请求时及非内部请求时增加计数(避免重复计数)
             // 且仅当开启访问日志时才计数
             if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
                 try {
-                    // 初始化下载计数(如果不存在)
-                    if (typeof profile.downloadCount !== 'number') {
-                        profile.downloadCount = 0;
-                    }
-                    // 增加计数
-                    profile.downloadCount += 1;
-
-                    // 更新存储中的订阅组数据
-                    const updatedProfiles = allProfiles.map(p =>
-                        ((p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier)
-                            ? profile
-                            : p
-                    );
-
-                    // 异步保存,不阻塞响应
+                    const downloadCountKey = getProfileDownloadCountKey(profile);
+                    const currentCount = Number(await storageAdapter.get(downloadCountKey)) || 0;
                     context.waitUntil(
-                        storageAdapter.put(KV_KEY_PROFILES, updatedProfiles)
+                        storageAdapter.put(downloadCountKey, currentCount + 1)
                             .catch(err => console.error('[Download Count] Failed to update:', err))
                     );
 
@@ -188,63 +252,13 @@ export async function handleMisubRequest(context) {
             return new Response('Invalid Token', { status: 403 });
         }
         targetMisubs = allMisubs.filter(s => s.enabled);
-        // [修正] 使用 config 變量
-        effectiveSubConverter = config.subConverter;
-        effectiveSubConfig = config.subConfig;
     }
 
-    if (!effectiveSubConverter || effectiveSubConverter.trim() === '') {
-        return new Response('Subconverter backend is not configured.', { status: 500 });
-    }
+    const shouldSkipCertificateVerify = Boolean(config.builtinSkipCertVerify);
+    const shouldEnableUdp = Boolean(config.builtinEnableUdp);
 
-    const shouldSkipCertificateVerify = Boolean(config.subConverterScv);
-    const shouldEnableUdp = Boolean(config.subConverterUdp);
-
-    let targetFormat = url.searchParams.get('target');
-    if (!targetFormat) {
-        const supportedFormats = ['clash', 'singbox', 'surge', 'loon', 'base64', 'v2ray', 'trojan'];
-        for (const format of supportedFormats) {
-            if (url.searchParams.has(format)) {
-                if (format === 'v2ray' || format === 'trojan') { targetFormat = 'base64'; } else { targetFormat = format; }
-                break;
-            }
-        }
-    }
-    if (!targetFormat) {
-        const ua = userAgentHeader.toLowerCase();
-        // 使用陣列來保證比對的優先順序
-        const uaMapping = [
-            // Mihomo/Meta 核心的客戶端 - 需要clash格式
-            ['flyclash', 'clash'],
-            ['mihomo', 'clash'],
-            ['clash.meta', 'clash'],
-            ['clash-verge', 'clash'],
-            ['meta', 'clash'],
-
-            // 其他客戶端
-            ['stash', 'clash'],
-            ['nekoray', 'clash'],
-            ['sing-box', 'singbox'],
-            ['shadowrocket', 'base64'],
-            ['v2rayn', 'base64'],
-            ['v2rayng', 'base64'],
-            ['surge', 'surge'],
-            ['loon', 'loon'],
-            ['quantumult%20x', 'quanx'],
-            ['quantumult', 'quanx'],
-
-            // 最後才匹配通用的 clash，作為向下相容
-            ['clash', 'clash']
-        ];
-
-        for (const [keyword, format] of uaMapping) {
-            if (ua.includes(keyword)) {
-                targetFormat = format;
-                break; // 找到第一個符合的就停止
-            }
-        }
-    }
-    if (!targetFormat) { targetFormat = 'base64'; }
+    // 使用统一的确定目标格式的方法（此方法中包含了处理各类客户端如 Surge 等对应版本的最新支持规则）
+    let targetFormat = determineTargetFormat(userAgentHeader, url.searchParams);
 
     // [Access Log] Record access log and stats if enabled
     if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
@@ -275,6 +289,36 @@ export async function handleMisubRequest(context) {
         }
     }
 
+    // [Subconverter Engine Selection] Priority: URL Parameter > Profile Settings > Global Settings
+    const profileSub = currentProfile?.subconverter || {};
+    const globalSub = config.subconverter || {};
+    
+    // Determine the effective engine mode
+    const builtinParam = (url.searchParams.get('builtin') || '').toLowerCase();
+    const engineParam = (url.searchParams.get('engine') || '').toLowerCase();
+    const effectiveEngine = engineParam || (builtinParam === 'external' ? 'external' : (builtinParam === 'true' ? 'builtin' : '')) || profileSub.engineMode || globalSub.engineMode || 'builtin';
+    const isExternalMode = effectiveEngine === 'external';
+    const useBuiltin = !isExternalMode;
+
+    
+    const globalTemplateUrl = resolveTemplateUrl(config.transformConfigMode, config.transformConfig, '');
+    const templateUrl = currentProfile
+        ? resolveTemplateUrl(currentProfile.transformConfigMode, currentProfile.transformConfig, globalTemplateUrl)
+        : globalTemplateUrl;
+    const templateSource = resolveTemplateSource(templateUrl);
+
+    // [逻辑统一] 规则等级：URL 参数 > 订阅组设置 > 全局设置 > 默认值 (std)
+    // [重要变更] 如果使用了远程自定义配置 (templateSource.kind === 'remote')，则完全禁用内置等级 (强制为 none)
+    const resolvedProfileLevel = currentProfile?.ruleLevel || currentProfile?.clashRuleLevel || '';
+    const resolvedGlobalLevel = config.ruleLevel || config.clashRuleLevel || 'std';
+    
+    let ruleLevel;
+    if (templateSource.kind === 'remote') {
+        ruleLevel = 'none';
+    } else {
+        ruleLevel = url.searchParams.get('level') || url.searchParams.get('ruleLevel') || resolvedProfileLevel || resolvedGlobalLevel;
+    }
+
     // === 缓存机制：快速响应客户端请求 ===
     const cacheKey = generateCacheKey(
         profileIdentifier ? 'profile' : 'token',
@@ -282,7 +326,7 @@ export async function handleMisubRequest(context) {
     );
 
     // 检查是否强制刷新（通过 URL 参数）
-    const forceRefresh = url.searchParams.has('refresh') || url.searchParams.has('nocache');
+    const forceRefresh = url.searchParams.has('refresh') || url.searchParams.has('nocache') || url.searchParams.has('debug');
 
     // 定义刷新函数（用于后台刷新）
     const refreshNodes = async (isBackground = false) => {
@@ -308,12 +352,12 @@ export async function handleMisubRequest(context) {
             domain
         };
 
-        const currentProfile = profileIdentifier ? allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier) : null;
+        const activeProfile = profileIdentifier ? allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier) : null;
 
         // 设置优先级：订阅组设置 > 全局设置 > 内置默认值
         // prefixSettings 回退逻辑
         const globalPrefixSettings = config.defaultPrefixSettings || {};
-        const profilePrefixSettings = currentProfile?.prefixSettings || null;
+        const profilePrefixSettings = activeProfile?.prefixSettings || null;
         const effectivePrefixSettings = { ...globalPrefixSettings };
 
         if (profilePrefixSettings && typeof profilePrefixSettings === 'object') {
@@ -330,20 +374,61 @@ export async function handleMisubRequest(context) {
 
         // nodeTransform 回退逻辑
         const globalNodeTransform = config.defaultNodeTransform || {};
-        const profileNodeTransform = currentProfile?.nodeTransform ?? null;
+        const globalNodeTransformPresets = Array.isArray(config.nodeTransformPresets) ? config.nodeTransformPresets : [];
+        const profileNodeTransform = activeProfile?.nodeTransform ?? null;
+        const profileNodeTransformPresetId = activeProfile?.nodeTransformPresetId || '';
+        const profilePresetNodeTransform = profileNodeTransformPresetId
+            ? (globalNodeTransformPresets.find(item => item?.id === profileNodeTransformPresetId)?.config || null)
+            : null;
         const hasProfileNodeTransform =
             profileNodeTransform && Object.keys(profileNodeTransform).length > 0;
 
         // nodeTransform 使用整体覆盖逻辑
         const effectiveNodeTransform = hasProfileNodeTransform
             ? profileNodeTransform
-            : globalNodeTransform;
+            : profilePresetNodeTransform
+            || globalNodeTransform;
 
         const generationSettings = {
             ...effectivePrefixSettings,
-            nodeTransform: effectiveNodeTransform,
-            name: subName
+            nodeTransform: { ...effectiveNodeTransform },
+            name: subName,
+            operators: Array.isArray(activeProfile?.operators) ? [...activeProfile.operators] : [],
+            exclude: urlExclude || activeProfile?.exclude,
+            include: urlInclude || activeProfile?.include
         };
+
+        // [Subconverter API] 动态注入更名算子 (rename=old@new|A@B)
+        if (urlRename) {
+            const renameGroups = urlRename.split('|');
+            renameGroups.forEach(group => {
+                const [regex, replace] = group.split('@');
+                if (regex) {
+                    generationSettings.operators.push({
+                        type: 'rename',
+                        enabled: true,
+                        params: {
+                            regex: {
+                                enabled: true,
+                                rules: [{
+                                    pattern: regex,
+                                    replacement: replace || '',
+                                    flags: 'gi'
+                                }]
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        // [Subconverter API] 控制 Emoji 注入
+        if (urlEmoji === 'false') {
+            generationSettings.nodeTransform.addFlagEmoji = false;
+            generationSettings.nodeTransform.removeFlagEmoji = true;
+        } else if (urlEmoji === 'true') {
+            generationSettings.nodeTransform.addFlagEmoji = true;
+        }
 
         const freshNodes = await generateCombinedNodeList(
             context, // 传入完整 context
@@ -351,8 +436,11 @@ export async function handleMisubRequest(context) {
             userAgentHeader,
             targetMisubs,
             prependedContentForSubconverter,
-            generationSettings,
-            isDebugToken
+            {
+                ...generationSettings,
+                // [强制透传] 确保 ruleLevel 在订阅组内能够生效
+                ruleLevel: ruleLevel || generationSettings.ruleLevel
+            }
         );
         const sourceNames = targetMisubs
             .filter(s => typeof s?.url === 'string' && s.url.startsWith('http'))
@@ -370,11 +458,96 @@ export async function handleMisubRequest(context) {
         targetMisubsCount: targetMisubs.length
     });
 
-    if (!env.workers) {
-        console.log(`[MiSub Nodes] Count/Length: ${combinedNodeList ? combinedNodeList.length : 0}`);
-    }
+    console.log(`[MiSub Nodes] Count/Length: ${combinedNodeList ? combinedNodeList.length : 0}`);
 
     const domain = url.hostname;
+
+    // [Support] External Subconverter Logic
+    // 1. If 'nodes' format requested, return Base64 nodes directly (DataSource for external converters)
+    if (targetFormat === 'nodes') {
+        const contentToEncode = isProfileExpired ? (DEFAULT_EXPIRED_NODE + '\n') : combinedNodeList;
+        // [兼容性修复] 第三方转换后端通常默认识别 Base64 编码的订阅。
+        // 虽然明文更直观，但为了通过后端的 WAF 和格式校验，恢复为标准 Base64 编码。
+        return new Response(base64EncodeUtf8(contentToEncode), { 
+            headers: { 
+                "Content-Type": "text/plain; charset=utf-8", 
+                'Cache-Control': 'no-store, no-cache',
+                'X-MiSub-Mode': 'node-export-base64'
+            } 
+        });
+    }
+
+    // 2. If external mode active, build the redirect URL and return 302
+    if (isExternalMode && targetFormat !== 'base64') {
+        let backend = url.searchParams.get('backend') || profileSub.backend || globalSub.defaultBackend || "https://sub.id9.cc/sub?";
+        
+        // [加固] 防止 UI 标签泄漏到配置中（例如出现 "subconverter 后端" 字样）
+        if (typeof backend === 'string' && (backend.includes('后端') || backend.includes('参数'))) {
+            backend = "https://subapi.cmliussss.net/sub?";
+        }
+
+        // [自动纠错] 如果地址不带 http/https 协议，自动补全，防止 URL 构造失败
+        if (backend && typeof backend === 'string' && !backend.startsWith('http://') && !backend.startsWith('https://')) {
+            backend = 'http://' + backend;
+        }
+
+        const externalUrl = new URL(backend);
+        externalUrl.searchParams.set('target', targetFormat.includes('&') ? targetFormat.split('&')[0] : targetFormat);
+        
+        // Data source is THIS worker, but forcing builtin and nodes format
+        const dataSourceUrl = new URL(request.url);
+        
+        // [加固] 彻底清理 URL 参数，防止参数污染导致后端返回 400 错误
+        const paramsToClear = ['target', 'engine', 'builtin', 'clash', 'singbox', 'surge', 'loon', 'quanx', 'egern', 'base64', 'v2ray', 'trojan'];
+        paramsToClear.forEach(p => dataSourceUrl.searchParams.delete(p));
+        
+        dataSourceUrl.searchParams.set('target', 'nodes');
+        dataSourceUrl.searchParams.set('engine', 'builtin');
+
+        // [关键修复] 确保后端拉取数据时包含身份令牌，否则会报 401 (No nodes found)
+        // 恢复显式注入逻辑，以确保在所有路径下第三方转换后端都能成功访问内部数据源
+        if (!dataSourceUrl.searchParams.has('token')) {
+            const authToken = token || currentProfile?.token || config.mytoken;
+            if (authToken) dataSourceUrl.searchParams.set('token', authToken);
+        }
+
+        externalUrl.searchParams.set('url', dataSourceUrl.toString());
+        
+        // Map Boolean Flags
+        const effectiveOptions = { ...globalSub.defaultOptions, ...profileSub.options };
+        const flagMap = { udp: 'udp', emoji: 'emoji', scv: 'scv', sort: 'sort', tfo: 'tfo', list: 'list' };
+        
+        // [元数据核心支持] 如果是 Meta 核心，告知第三方转换后端使用 Meta 语法
+        if (isMetaCore(userAgentHeader, url.searchParams)) {
+            externalUrl.searchParams.set('meta', 'true');
+        }
+
+        Object.entries(flagMap).forEach(([key, paramName]) => {
+            const val = url.searchParams.has(paramName) 
+                ? url.searchParams.get(paramName) === 'true' 
+                : effectiveOptions[key];
+            externalUrl.searchParams.set(paramName, val ? 'true' : 'false');
+        });
+
+        // Pass Remote Config if applicable
+        if (templateUrl && templateSource.kind === 'remote') {
+            // [回滚] 恢复使用 URL 传递配置。虽然 Base64 更可靠，但并非所有后端都支持 base64: 前缀
+            externalUrl.searchParams.set('config', templateSource.value);
+        }
+
+        // Add File Name
+        externalUrl.searchParams.set('filename', subName);
+
+        // [重要修复] 使用手动构建出的 302 响应，以确保头部是可变的 (Mutable)
+        return new Response(null, {
+            status: 302,
+            headers: {
+                'Location': externalUrl.toString(),
+                'Cache-Control': 'no-store, no-cache',
+                'X-MiSub-Mode': 'external-redirect-v2'
+            }
+        });
+    }
 
     if (targetFormat === 'base64') {
         let contentToEncode;
@@ -398,9 +571,9 @@ export async function handleMisubRequest(context) {
             context.waitUntil(
                 sendEnhancedTgNotification(
                     config,
-                    '🛰️ *订阅被访问*',
+                    '🛰️ <b>订阅被访问</b>',
                     clientIp,
-                    `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`${targetFormat}\`\n*订阅组:* \`${subName}\``
+                    `<b>域名:</b> <code>${tgEscape(domain)}</code>\n<b>客户端:</b> <code>${tgEscape(userAgentHeader)}</code>\n<b>请求格式:</b> <code>${tgEscape(targetFormat)}</code>\n<b>订阅组:</b> <code>${tgEscape(subName)}</code>`
                 )
             );
 
@@ -420,52 +593,94 @@ export async function handleMisubRequest(context) {
             }
         }
 
-        return new Response(btoa(unescape(encodeURIComponent(contentToEncode))), { headers });
+        return new Response(base64EncodeUtf8(contentToEncode), { headers });
     }
 
-    const base64Content = btoa(unescape(encodeURIComponent(combinedNodeList)));
 
-    const callbackToken = await getCallbackToken(env);
-    const callbackPath = profileIdentifier ? `/${token}/${profileIdentifier}` : `/${token}`;
-    const publicBaseUrl = getPublicBaseUrl(env, url);
-    const callbackUrl = `${publicBaseUrl.origin}${callbackPath}?target=base64&callback_token=${callbackToken}`;
+    // [Subconverter API] URL 参数优先级高于全局/Profile 设置
+    const finalSkipCertVerify = urlScv !== null ? (urlScv === 'true' || urlScv === '1') : shouldSkipCertificateVerify;
+    const finalEnableUdp = urlUdp !== null ? (urlUdp === 'true' || urlUdp === '1') : shouldEnableUdp;
+    const finalEnableTfo = urlTfo === 'true' || urlTfo === '1';
 
-    // [Debug Logging for Docker/Zeabur]
-    if (!env.workers) { // 简单判断非 Workers 环境（Docker 环境通常没有 env.workers 属性，或者可以凭其他特征判断）
-        console.log(`[MiSub Debug] Profile: ${profileIdentifier}, Token: ${token}`);
-        console.log(`[MiSub Debug] Callback URL: ${callbackUrl}`);
-    }
-    if (url.searchParams.get('callback_token') === callbackToken) {
-        const headers = { "Content-Type": "text/plain; charset=utf-8", 'Cache-Control': 'no-store, no-cache' };
-        return new Response(base64Content, { headers });
-    }
+    const builtinOptions = {
+        fileName: subName,
+        managedConfigUrl: '',
+        interval: config.UpdateInterval || 86400,
+        skipCertVerify: finalSkipCertVerify,
+        enableUdp: finalEnableUdp,
+        enableTfo: finalEnableTfo,
+        ruleLevel: ruleLevel, // 统一后的规则等级
+        isMeta: isMetaCore(userAgentHeader, url.searchParams)
+    };
 
-    // [新增] 内置 Clash 生成器 - 当 builtin=1 或 builtin=clash 时使用
-    // 优势：完整保留 dialer-proxy、reality-opts 等特殊参数
-    const useBuiltinClash = url.searchParams.get('builtin') === '1' ||
-        url.searchParams.get('builtin') === 'clash' ||
-        url.searchParams.get('native') === '1';
+    const managedConfigUrl = buildManagedConfigUrl(request.url);
 
-    if (useBuiltinClash && targetFormat === 'clash') {
+    const shouldUseBuiltin = useBuiltin && (
+        targetFormat === 'clash' ||
+        targetFormat === 'egern' ||
+        targetFormat.startsWith('surge') ||
+        targetFormat === 'loon' ||
+        targetFormat === 'quanx' ||
+        targetFormat === 'singbox' ||
+        targetFormat === 'sing-box'
+    );
+
+    if (shouldUseBuiltin) {
         try {
-            const clashConfig = generateBuiltinClashConfig(combinedNodeList, {
-                fileName: subName,
-                enableUdp: Boolean(config.subConverterUdp)
+            const totalUserInfo = targetMisubs.reduce((acc, sub) => {
+                if (sub.enabled && sub.userInfo) {
+                    return {
+                        upload: (acc.upload || 0) + (sub.userInfo.upload || 0),
+                        download: (acc.download || 0) + (sub.userInfo.download || 0),
+                        total: (acc.total || 0) + (sub.userInfo.total || 0),
+                        expire: Math.max(acc.expire || 0, sub.userInfo.expire || 0)
+                    };
+                }
+                return acc;
+            }, { upload: 0, download: 0, total: 0, expire: 0 });
+
+            const userInfoHeader = totalUserInfo.total > 0 
+                ? `upload=${totalUserInfo.upload}; download=${totalUserInfo.download}; total=${totalUserInfo.total}; expire=${totalUserInfo.expire}`
+                : null;
+
+            let { content: finalContent, contentType, headers: resultHeaders } = await ProcessorService.renderOutput({
+                targetFormat,
+                combinedNodeList,
+                subName,
+                config,
+                builtinOptions,
+                templateSource,
+                managedConfigUrl,
+                storageAdapter,
+                userInfoHeader
             });
 
+            // [Subconverter API] 处理 list=true 逻辑：仅输出节点片段
+            if (urlList) {
+                const extracted = extractProxySectionFromBuiltin(finalContent, targetFormat);
+                if (extracted) {
+                    finalContent = extracted;
+                    contentType = 'text/plain; charset=utf-8';
+                }
+            }
+
+            const isJson = targetFormat === 'singbox' || targetFormat === 'sing-box';
             const responseHeaders = new Headers({
-                "Content-Disposition": `attachment; filename*=utf-8''${encodeURIComponent(subName)}`,
-                'Content-Type': 'text/yaml; charset=utf-8',
+                "Content-Disposition": `attachment; filename="${encodeURIComponent(subName)}"; filename*=utf-8''${encodeURIComponent(subName)}`,
+                'Content-Type': contentType,
                 'Cache-Control': 'no-store, no-cache',
-                'X-MiSub-Mode': 'builtin-clash'
+                'X-MiSub-Mode': `builtin-${targetFormat}`,
+                'Access-Control-Allow-Origin': '*'
             });
 
-            // 添加缓存状态头
-            Object.entries(cacheHeaders).forEach(([key, value]) => {
-                responseHeaders.set(key, value);
-            });
+            if (userInfoHeader) {
+                responseHeaders.set('Subscription-Userinfo', userInfoHeader);
+                responseHeaders.set('Profile-Update-Interval', String(config.UpdateInterval || 24));
+            }
 
-            // 发送通知和日志
+            Object.entries(resultHeaders).forEach(([k, v]) => responseHeaders.set(k, v));
+            Object.entries(cacheHeaders).forEach(([key, value]) => responseHeaders.set(key, value));
+
             if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
                 const clientIp = request.headers.get('CF-Connecting-IP')
                     || request.headers.get('X-Real-IP')
@@ -474,9 +689,9 @@ export async function handleMisubRequest(context) {
                 context.waitUntil(
                     sendEnhancedTgNotification(
                         config,
-                        '🛰️ *订阅被访问* (内置转换)',
+                        '🛰️ <b>订阅被访问</b> (内置转换)',
                         clientIp,
-                        `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`${targetFormat}\`\n*订阅组:* \`${subName}\``
+                        `<b>域名:</b> <code>${tgEscape(domain)}</code>\n<b>客户端:</b> <code>${tgEscape(userAgentHeader)}</code>\n<b>请求格式:</b> <code>${tgEscape(targetFormat)}</code>\n<b>订阅组:</b> <code>${tgEscape(subName)}</code>`
                     )
                 );
 
@@ -486,7 +701,7 @@ export async function handleMisubRequest(context) {
                         env,
                         request,
                         userAgentHeader,
-                        targetFormat: 'clash (builtin)',
+                        targetFormat: `builtin-${targetFormat}`,
                         token,
                         profileIdentifier,
                         subName,
@@ -495,159 +710,17 @@ export async function handleMisubRequest(context) {
                 }
             }
 
-            return new Response(clashConfig, { headers: responseHeaders });
+            return new Response(finalContent, { headers: responseHeaders });
+
         } catch (e) {
-            console.error('[BuiltinClash] Generation failed:', e);
-            // 回退到 subconverter
+            console.error(`[Builtin${targetFormat}] Generation failed:`, e);
         }
     }
 
+    const base64Headers = { "Content-Type": "text/plain; charset=utf-8", 'Cache-Control': 'no-store, no-cache' };
+    Object.entries(cacheHeaders).forEach(([key, value]) => {
+        base64Headers[key] = value;
+    });
 
-    const candidates = getSubconverterCandidates(effectiveSubConverter);
-    let lastError = null;
-
-    try {
-        // [New Implementation] Use centralized client
-        const result = await fetchFromSubconverter(candidates, {
-            targetFormat,
-            callbackUrl,
-            subConfig: effectiveSubConfig,
-            subName,
-            cacheHeaders,
-            enableScv: shouldSkipCertificateVerify,
-            enableUdp: shouldEnableUdp,
-            enableEmoji: shouldUseEmoji,
-            timeout: 30000 // 30s timeout
-        });
-
-        // [Success Logic]
-        if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
-            const clientIp = request.headers.get('CF-Connecting-IP')
-                || request.headers.get('X-Real-IP')
-                || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
-                || 'N/A';
-            context.waitUntil(
-                sendEnhancedTgNotification(
-                    config,
-                    '🛰️ *订阅被访问*',
-                    clientIp,
-                    `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`${targetFormat}\`\n*订阅组:* \`${subName}\``
-                )
-            );
-
-            if (config.enableAccessLog) {
-                logAccessSuccess({
-                    context,
-                    env,
-                    request,
-                    userAgentHeader,
-                    targetFormat,
-                    token,
-                    profileIdentifier,
-                    subName,
-                    domain
-                });
-            }
-        }
-
-        return result.response;
-
-    } catch (e) {
-        lastError = e;
-        console.error('[MiSub] Subconverter call failed:', e);
-    }
-
-    // 净化错误信息（移除换行符和双引号），防止 header 异常和 YAML 语法错误
-    const safeErrorMessage = (lastError ? lastError.message : 'Unknown subconverter error')
-        .replace(/[\r\n]+/g, ' ')
-        .replace(/"/g, "'")
-        .trim();
-    console.error(`[MiSub Final Error] ${safeErrorMessage}`);
-
-    // [Deferred Logging] Log Error for Subconverter Failures (Timeout/Error)
-    if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
-        logAccessError({
-            context,
-            env,
-            request,
-            userAgentHeader,
-            targetFormat,
-            token,
-            profileIdentifier,
-            subName,
-            domain,
-            errorMessage: safeErrorMessage
-        });
-    }
-
-    // 提供回退的 Base64 输出，避免客户端直接收到 502
-    if (combinedNodeList) {
-        const fallbackHeaders = new Headers({
-            "Content-Type": "text/plain; charset=utf-8",
-            'Cache-Control': 'no-store, no-cache',
-            'X-MiSub-Fallback': 'base64'
-        });
-
-        // 保留缓存状态提示，便于客户端诊断
-        Object.entries(cacheHeaders).forEach(([key, value]) => {
-            fallbackHeaders.set(key, value);
-        });
-
-        // 附带简短错误信息，防止 header 过长
-        fallbackHeaders.set('X-MiSub-Error', safeErrorMessage.slice(0, 200));
-
-        // [Fallback Success] 也发送 Telegram 通知，因为用户仍获取了订阅内容
-        if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
-            const clientIp = request.headers.get('CF-Connecting-IP')
-                || request.headers.get('X-Real-IP')
-                || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
-                || 'N/A';
-            context.waitUntil(
-                sendEnhancedTgNotification(
-                    config,
-                    '🛰️ *订阅被访问* (Fallback)',
-                    clientIp,
-                    `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`base64\`\n*订阅组:* \`${subName}\`\n*错误:* \`${safeErrorMessage}\``
-                )
-            );
-        }
-
-        // [Improved Fallback] 为不同客户端提供更友好的错误展示
-        if (targetFormat === 'clash' || targetFormat === 'loon' || targetFormat === 'surge') {
-            const fallbackYaml = `
-proxies:
-  - name: "❌ 生成失败: ${safeErrorMessage.slice(0, 50).replace(/:/g, ' ')}"
-    type: trojan
-    server: 127.0.0.1
-    port: 443
-    password: error
-    sni: error.com
-    skip-cert-verify: true
-    udp: false
-
-proxy-groups:
-  - name: "⚠️ 错误节点"
-    type: select
-    proxies:
-      - "❌ 生成失败: ${safeErrorMessage.slice(0, 50).replace(/:/g, ' ')}"
-
-rules:
-  - MATCH,DIRECT
-`;
-            return new Response(fallbackYaml, {
-                headers: {
-                    "Content-Type": "text/yaml; charset=utf-8",
-                    'Cache-Control': 'no-store, no-cache',
-                    'X-MiSub-Fallback': 'yaml',
-                    'X-MiSub-Error': safeErrorMessage.slice(0, 200)
-                },
-                status: 200
-            });
-        }
-
-        const fallbackContent = btoa(unescape(encodeURIComponent(combinedNodeList)));
-        return new Response(fallbackContent, { headers: fallbackHeaders, status: 200 });
-    }
-
-    return new Response(`Error connecting to subconverter: ${safeErrorMessage}`, { status: 502 });
+    return new Response(base64EncodeUtf8(combinedNodeList), { headers: base64Headers });
 }

@@ -21,7 +21,7 @@ export async function handleGithubReleaseRequest(request, env) {
         const storage = StorageFactory.createAdapter(env, STORAGE_TYPES.KV);
 
         // Try to get from cache
-        const cachedWrapper = await storage.get(CACHE_KEY, 'json');
+        const cachedWrapper = await storage.get(CACHE_KEY);
 
         if (cachedWrapper && cachedWrapper.timestamp) {
             const age = Date.now() - cachedWrapper.timestamp;
@@ -81,7 +81,8 @@ export async function handleGithubReleaseRequest(request, env) {
             tag_name: data.tag_name,
             html_url: data.html_url,
             published_at: data.published_at,
-            name: data.name
+            name: data.name,
+            body: data.body || ''
         };
 
         const cachePayload = {

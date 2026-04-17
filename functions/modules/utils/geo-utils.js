@@ -8,7 +8,7 @@
  * 支持多语言地区识别
  */
 export const REGION_KEYWORDS = {
-    '香港': ['HK', 'HKG', '香港', 'Hong Kong', 'HongKong'],
+    '香港': ['HK', 'HKG', 'HKT', '香港', 'Hong Kong', 'HongKong'],
     '台湾': ['TW', 'TPE', '台湾', '台北', 'Taiwan', 'Taipei'],
     '新加坡': ['SG', 'SIN', '新加坡', 'Singapore'],
     '日本': ['JP', 'JPN', 'NRT', 'HND', 'KIX', 'FUK', '东京', '大阪', '日本', 'Japan', 'Tokyo', 'Osaka', 'Fukuoka', 'Yokohama'],
@@ -303,7 +303,7 @@ export function getRegionKeywords(region) {
  * @returns {string} 对应的 Emoji，如果未找到则返回空字符串
  */
 export function getRegionEmoji(region) {
-    return REGION_EMOJI[region] || '';
+    return REGION_EMOJI[region] || (region === '其他' || !region ? '🌍' : '');
 }
 
 /**
@@ -509,10 +509,50 @@ export function parseNodeInfo(nodeUrl) {
                         }
                     }
                 }
-            } catch (e) {
-                console.debug('[GeoUtils] SSR decode failed:', e);
-            }
-        } else {
+} catch (e) {
+console.debug('[GeoUtils] SSR decode failed:', e);
+}
+} else if (protocol === 'wireguard') {
+// WireGuard 格式: wireguard://privatekey@server:port?params#name
+let body = nodeUrl.substring('wireguard://'.length);
+
+// 提取名称
+const hIndex = body.indexOf('#');
+if (hIndex !== -1) {
+try {
+nodeName = decodeURIComponent(body.substring(hIndex + 1));
+} catch (e) {
+nodeName = body.substring(hIndex + 1);
+}
+body = body.substring(0, hIndex);
+}
+
+// 提取服务器和端口
+const atIndex = body.lastIndexOf('@');
+if (atIndex !== -1) {
+const serverPart = body.substring(atIndex + 1);
+const qIndex = serverPart.indexOf('?');
+const addrPart = qIndex !== -1 ? serverPart.substring(0, qIndex) : serverPart;
+
+// 处理 IPv6
+if (addrPart.startsWith('[')) {
+const closeBracket = addrPart.indexOf(']');
+if (closeBracket !== -1) {
+server = addrPart.substring(1, closeBracket);
+const afterBracket = addrPart.substring(closeBracket + 1);
+if (afterBracket.startsWith(':')) {
+port = afterBracket.substring(1);
+}
+}
+} else {
+const parts = addrPart.split(':');
+if (parts.length >= 2) {
+server = parts[0];
+port = parts[1];
+}
+}
+}
+} else {
             // 通用格式: protocol://user@host:port... 或 protocol://host:port...
             // vless, trojan, hysteria2, socks5, http 等
             // 去掉 protocol://

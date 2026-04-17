@@ -14,8 +14,13 @@ const routes = [
         path: '/',  // Root path is HomeView (Smart Wrapper)
         name: 'Home',
         component: HomeView,
-        alias: '/explore',
         meta: { title: '首页', isPublic: true } // Publicly accessible, view handles content
+    },
+    {
+        path: '/explore',
+        name: 'Explore',
+        component: HomeView,
+        meta: { title: '公开页', isPublic: true }
     },
     {
         path: '/dashboard', // Explicit dashboard route redirects to home or is alias
@@ -72,6 +77,19 @@ const router = createRouter({
             return savedPosition;
         } else {
             return { top: 0 };
+        }
+    }
+});
+
+// 自动恢复动态 chunk 加载失败导致的白屏
+router.onError((error) => {
+    const message = error?.message || '';
+    if (message.includes('Failed to fetch dynamically imported module')
+        || message.includes('error loading dynamically imported module')) {
+        const reloadKey = 'misub:chunk-reload';
+        if (sessionStorage.getItem(reloadKey) !== '1') {
+            sessionStorage.setItem(reloadKey, '1');
+            window.location.reload();
         }
     }
 });

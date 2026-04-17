@@ -13,12 +13,13 @@ import { fetchSubscriptionNodes } from './node-fetcher.js';
  * @param {string} userAgent - 用户代理
  * @returns {Promise<Object>} 处理结果
  */
-export async function handleSingleSubscriptionMode(request, env, subscriptionId, userAgent) {
+export async function handleSingleSubscriptionMode(request, env, subscriptionId, userAgent, skipCertVerify = false) {
     const storageAdapter = StorageFactory.createAdapter(env, await StorageFactory.getStorageType(env));
 
     // 查找订阅
-    const allSubscriptions = await storageAdapter.get(KV_KEY_SUBS) || [];
-    const subscription = allSubscriptions.find(sub => sub.id === subscriptionId);
+    const subscription = typeof storageAdapter.getSubscriptionById === 'function'
+        ? await storageAdapter.getSubscriptionById(subscriptionId)
+        : (await storageAdapter.get(KV_KEY_SUBS) || []).find(sub => sub.id === subscriptionId);
 
     if (!subscription || !subscription.enabled) {
         return createJsonResponse({ error: '订阅不存在或已禁用' }, 404);
@@ -53,7 +54,7 @@ export async function handleSingleSubscriptionMode(request, env, subscriptionId,
     }
 
     // HTTP订阅：获取节点
-    const result = await fetchSubscriptionNodes(subscription.url, subscription.name, userAgent, subscription.customUserAgent, false, subscription.exclude);
+    const result = await fetchSubscriptionNodes(subscription.url, subscription.name, userAgent, subscription.customUserAgent, false, subscription.exclude, subscription.fetchProxy, skipCertVerify, Boolean(subscription?.plusAsSpace));
 
     return {
         success: true,
@@ -74,9 +75,9 @@ export async function handleSingleSubscriptionMode(request, env, subscriptionId,
  * @param {string} userAgent - 用户代理
  * @returns {Promise<Object>} 处理结果
  */
-export async function handleDirectUrlMode(subscriptionUrl, userAgent) {
+export async function handleDirectUrlMode(subscriptionUrl, userAgent, skipCertVerify = false, plusAsSpace = false) {
     const debug = subscriptionUrl.includes('b0b422857bb46aba65da8234c84f38c6');
-    const result = await fetchSubscriptionNodes(subscriptionUrl, '预览订阅', userAgent, null, debug, '');
+    const result = await fetchSubscriptionNodes(subscriptionUrl, '预览订阅', userAgent, null, debug, '', null, skipCertVerify, plusAsSpace);
 
     return {
         success: true,

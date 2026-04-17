@@ -194,7 +194,7 @@ onUnmounted(() => {
           <NodeManager :manual-nodes="manualNodes" :paginated-manual-nodes="paginatedManualNodes"
             :current-page="manualNodesCurrentPage" :total-pages="manualNodesTotalPages" :search-term="searchTerm"
             @add="addNode" @delete="deleteNode" @edit="updateNode" @change-page="changeManualNodesPage"
-            @update:search-term="newVal => searchTerm = newVal" @mark-dirty="markDirty" @auto-sort="autoSortNodes"
+            @update:search-term="newVal => searchTerm.value = newVal" @mark-dirty="markDirty" @auto-sort="autoSortNodes"
             @deduplicate="deduplicateNodes" @import="showSubscriptionImportModal = true"
             @delete-all="showDeleteNodesModal = true" />
         </div>
@@ -246,7 +246,7 @@ onUnmounted(() => {
 
     <ProfileModal v-if="showProfileModal" v-model:show="showProfileModal" :profile="editingProfile"
       :is-new="isNewProfile" :all-subscriptions="subscriptions" :all-manual-nodes="manualNodes"
-      @save="handleSaveProfile" size="2xl" />
+      @save="handleSaveProfile" size="6xl" />
 
     <SubscriptionImportModal v-if="showSubscriptionImportModal" v-model:show="showSubscriptionImportModal"
       @import="addNodesFromBulk" />
